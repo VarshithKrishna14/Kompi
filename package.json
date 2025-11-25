@@ -1,20 +1,20 @@
 {
-  "name": "opus-codex-gemini",
+  "name": "observability-processor",
   "version": "1.0.0",
-  "private": true,
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
+  "description": "Log processing with anomaly detection",
+  "main": "apps/processor/src/index.ts",
   "scripts": {
-    "build": "turbo build",
-    "dev": "turbo dev",
-    "test": "turbo test",
-    "lint": "turbo lint"
+    "test": "ts-node apps/processor/src/tests/anomaly-detector.test.ts",
+    "start": "ts-node apps/processor/src/index.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.30.0",
+    "postgres": "^3.4.0"
   },
   "devDependencies": {
-    "turbo": "^2.0.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0"
   }
 }
 
