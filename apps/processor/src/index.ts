@@ -24,10 +24,19 @@ import {
 } from './anomaly-detector.js';
 
 import {
+  AlertDeduplicator,
+  createAlertDeduplicator,
+  type DeduplicationConfig,
+  type DeduplicationResult,
+  type AlertContext,
+} from './alert-deduplicator.js';
+
+import {
   logEntries,
   errorRateMetrics,
   baselineStates,
   anomalyAlerts,
+  alertDedupLocks,
   metricSnapshots,
   type LogEntry,
   type NewLogEntry,
@@ -53,6 +62,10 @@ export interface ProcessorConfig {
   readonly debug: boolean;
   /** Error rate calculation window in milliseconds */
   readonly errorRateWindowMs: number;
+  /** Alert deduplication configuration */
+  readonly deduplicationConfig?: Partial<DeduplicationConfig>;
+  /** Enable alert deduplication (default: true) */
+  readonly enableDeduplication: boolean;
 }
 
 export interface LogInput {
@@ -82,6 +95,15 @@ export interface ProcessorStats {
     avgProcessingTimeMs: number;
     detectorCount: number;
   };
+  readonly deduplicationStats: {
+    enabled: boolean;
+    processorId: string | null;
+    deduplicatedCount: number;
+    lockAttempts: number;
+    locksAcquired: number;
+    duplicatesDetected: number;
+    lockFailures: number;
+  } | null;
 }
 
 // ============================================================================
@@ -95,6 +117,7 @@ const DEFAULT_PROCESSOR_CONFIG: ProcessorConfig = {
   baselinePersistIntervalMs: 60_000,
   debug: process.env['DEBUG'] === 'true',
   errorRateWindowMs: 60_000,
+  enableDeduplication: true,
 } as const;
 
 // ============================================================================
@@ -184,8 +207,11 @@ export class LogProcessor {
   private readonly config: ProcessorConfig;
   private readonly anomalyManager: AnomalyDetectionManager;
   private readonly errorRateTracker: ErrorRateTracker;
+  private readonly deduplicator: AlertDeduplicator | null;
   private readonly logBuffer: NewLogEntry[] = [];
   private readonly alertBuffer: NewAnomalyAlertRow[] = [];
+  // Track pending dedup locks to mark as created after flush
+  private readonly pendingAlertLocks: Map<string, { lockId: string; alertRow: NewAnomalyAlertRow }> = new Map();
 
   private db: PostgresJsDatabase | null = null;
   private sqlClient: postgres.Sql | null = null;
@@ -197,11 +223,22 @@ export class LogProcessor {
   private processedCount: number = 0;
   private anomalyCount: number = 0;
   private totalProcessingTimeNs: bigint = 0n;
+  private deduplicatedCount: number = 0;
 
   constructor(config: Partial<ProcessorConfig> = {}) {
     this.config = { ...DEFAULT_PROCESSOR_CONFIG, ...config };
     this.anomalyManager = new AnomalyDetectionManager(this.config.anomalyConfig);
     this.errorRateTracker = new ErrorRateTracker(this.config.errorRateWindowMs);
+
+    // Initialize deduplicator if enabled
+    if (this.config.enableDeduplication) {
+      this.deduplicator = createAlertDeduplicator({
+        ...this.config.deduplicationConfig,
+        debug: this.config.debug,
+      });
+    } else {
+      this.deduplicator = null;
+    }
 
     // Register alert handler
     this.anomalyManager.onAlert(this.handleAlert.bind(this));
@@ -220,6 +257,12 @@ export class LogProcessor {
     // Connect to database
     this.sqlClient = postgres(this.config.databaseUrl);
     this.db = drizzle(this.sqlClient);
+
+    // Initialize deduplicator with database connection
+    if (this.deduplicator && this.db) {
+      this.deduplicator.initialize(this.db);
+      this.log(`Deduplication enabled with processor ID: ${this.deduplicator.getProcessorId()}`);
+    }
 
     // Load persisted baselines
     await this.loadBaselines();
@@ -310,12 +353,24 @@ export class LogProcessor {
   }
 
   /**
-   * Handle anomaly alerts
+   * Handle anomaly alerts with distributed deduplication.
+   * 
+   * When multiple processors detect the same anomaly within 5 seconds,
+   * only one will create an alert. The deduplication is handled atomically
+   * using PostgreSQL as the coordination layer.
    */
   private handleAlert(alert: AnomalyAlert): void {
+    // Fire and forget - we use void to handle the promise
+    void this.handleAlertAsync(alert);
+  }
+
+  /**
+   * Async handler for alert processing with deduplication.
+   */
+  private async handleAlertAsync(alert: AnomalyAlert): Promise<void> {
     this.log(`ALERT [${alert.severity.toUpperCase()}]: ${alert.metricKey} - ${alert.result.details}`);
 
-    // Buffer alert for database insert
+    // Build the alert row first
     const alertRow: NewAnomalyAlertRow = {
       metricKey: alert.metricKey,
       timestamp: new Date(alert.timestamp),
@@ -331,7 +386,47 @@ export class LogProcessor {
       details: alert.result.details,
     };
 
-    this.alertBuffer.push(alertRow);
+    // If deduplication is enabled, try to acquire the lock
+    if (this.deduplicator) {
+      const alertContext: AlertContext = {
+        metricKey: alert.metricKey,
+        anomalyType: alert.result.anomalyType,
+        detectedAt: alert.timestamp,
+        severity: alert.severity,
+      };
+
+      try {
+        const result = await this.deduplicator.tryAcquireLock(alertContext);
+
+        if (!result.shouldCreateAlert) {
+          // Another processor already handling this alert
+          this.deduplicatedCount++;
+          this.log(
+            `Alert deduplicated for ${alert.metricKey} ` +
+            `(owner: ${result.ownerProcessorId ?? 'unknown'})`
+          );
+          return;
+        }
+
+        // We won the lock - buffer the alert and track the lock for later marking
+        this.alertBuffer.push(alertRow);
+        
+        if (result.lockId) {
+          // Track this lock so we can mark it as created after flush
+          const trackingKey = `${alert.metricKey}|${alert.timestamp}`;
+          this.pendingAlertLocks.set(trackingKey, { lockId: result.lockId, alertRow });
+        }
+
+        this.log(`Alert lock acquired for ${alert.metricKey}, will create alert`);
+      } catch (error) {
+        // On deduplication error, fail open to avoid losing alerts
+        console.error('Deduplication error, creating alert anyway:', error);
+        this.alertBuffer.push(alertRow);
+      }
+    } else {
+      // Deduplication disabled - buffer directly
+      this.alertBuffer.push(alertRow);
+    }
   }
 
   /**
@@ -344,9 +439,11 @@ export class LogProcessor {
 
     const logsToInsert = [...this.logBuffer];
     const alertsToInsert = [...this.alertBuffer];
+    const pendingLocks = new Map(this.pendingAlertLocks);
 
     this.logBuffer.length = 0;
     this.alertBuffer.length = 0;
+    this.pendingAlertLocks.clear();
 
     try {
       // Insert logs
@@ -357,13 +454,34 @@ export class LogProcessor {
 
       // Insert alerts
       if (alertsToInsert.length > 0) {
-        await this.db.insert(anomalyAlerts).values(alertsToInsert);
+        const insertedAlerts = await this.db
+          .insert(anomalyAlerts)
+          .values(alertsToInsert)
+          .returning({ id: anomalyAlerts.id, metricKey: anomalyAlerts.metricKey, timestamp: anomalyAlerts.timestamp });
+        
         this.log(`Flushed ${alertsToInsert.length} anomaly alerts`);
+
+        // Mark dedup locks as created
+        if (this.deduplicator && insertedAlerts.length > 0) {
+          for (const inserted of insertedAlerts) {
+            const trackingKey = `${inserted.metricKey}|${inserted.timestamp.getTime()}`;
+            const pending = pendingLocks.get(trackingKey);
+            if (pending?.lockId) {
+              await this.deduplicator.markAlertCreated(pending.lockId, inserted.id);
+            }
+          }
+        }
       }
     } catch (error) {
       // Re-add failed items to buffer for retry
       this.logBuffer.push(...logsToInsert);
       this.alertBuffer.push(...alertsToInsert);
+      
+      // Re-add pending locks for retry
+      for (const [key, value] of pendingLocks) {
+        this.pendingAlertLocks.set(key, value);
+      }
+      
       console.error('Failed to flush to database:', error);
     }
   }
@@ -489,12 +607,28 @@ export class LogProcessor {
       ? Number(this.totalProcessingTimeNs / BigInt(this.processedCount))
       : 0;
 
+    // Get deduplication stats if enabled
+    let deduplicationStats: ProcessorStats['deduplicationStats'] = null;
+    if (this.deduplicator) {
+      const dedupStats = this.deduplicator.getStats();
+      deduplicationStats = {
+        enabled: true,
+        processorId: this.deduplicator.getProcessorId(),
+        deduplicatedCount: this.deduplicatedCount,
+        lockAttempts: dedupStats.lockAttempts,
+        locksAcquired: dedupStats.locksAcquired,
+        duplicatesDetected: dedupStats.duplicatesDetected,
+        lockFailures: dedupStats.lockFailures,
+      };
+    }
+
     return {
       processedCount: this.processedCount,
       anomalyCount: this.anomalyCount,
       avgProcessingTimeMs: avgTimeNs / 1_000_000,
       errorRateByService: this.errorRateTracker.getAllErrorRates(),
       detectorStats: this.anomalyManager.getPerformanceStats(),
+      deduplicationStats,
     };
   }
 
@@ -610,6 +744,11 @@ export class LogProcessor {
     // Persist baselines
     await this.persistBaselines();
 
+    // Shutdown deduplicator
+    if (this.deduplicator) {
+      await this.deduplicator.shutdown();
+    }
+
     // Close database connection
     if (this.sqlClient) {
       await this.sqlClient.end();
@@ -658,6 +797,14 @@ export {
   type AnomalyConfig,
   type BaselineState,
 } from './anomaly-detector.js';
+
+export {
+  AlertDeduplicator,
+  createAlertDeduplicator,
+  type DeduplicationConfig,
+  type DeduplicationResult,
+  type AlertContext,
+} from './alert-deduplicator.js';
 
 export * from './schema.js';
 

@@ -176,3 +176,62 @@ export const metricSnapshots = pgTable(
 export type MetricSnapshotRow = typeof metricSnapshots.$inferSelect;
 export type NewMetricSnapshotRow = typeof metricSnapshots.$inferInsert;
 
+// ============================================================================
+// Alert Deduplication Lock Table
+// ============================================================================
+
+/**
+ * Distributed alert deduplication using PostgreSQL as coordination layer.
+ * 
+ * Key design decisions:
+ * - dedup_key: Composite of metricKey + time bucket for deterministic collision detection
+ * - time_bucket: Normalized timestamp (floor to window) accounts for clock skew
+ * - processor_id: Identifies which processor won the lock (for debugging)
+ * - expires_at: TTL for crash recovery - if processor dies, lock auto-expires
+ * - claimed_at: When the lock was acquired (for metrics/debugging)
+ * 
+ * The deduplication window is calculated as:
+ *   effective_window = dedup_window (5s) + clock_skew (3s) = 8 seconds
+ *   
+ * Time buckets are normalized to 8-second boundaries to ensure any two alerts
+ * firing within 5 seconds of each other (accounting for 3s clock skew) will
+ * hash to the same bucket.
+ */
+export const alertDedupLocks = pgTable(
+  'alert_dedup_locks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    // Unique deduplication key: metricKey + anomalyType + normalized time bucket
+    dedupKey: varchar('dedup_key', { length: 512 }).notNull().unique(),
+    // The metric key this lock is for
+    metricKey: varchar('metric_key', { length: 255 }).notNull(),
+    // The anomaly type (for more granular deduplication)
+    anomalyType: varchar('anomaly_type', { length: 50 }).notNull(),
+    // Normalized time bucket (floor to dedup window boundary)
+    timeBucket: timestamp('time_bucket', { withTimezone: true }).notNull(),
+    // Original detection timestamp from the processor that won
+    detectedAt: timestamp('detected_at', { withTimezone: true }).notNull(),
+    // ID of the processor that acquired this lock
+    processorId: varchar('processor_id', { length: 128 }).notNull(),
+    // When the lock was claimed
+    claimedAt: timestamp('claimed_at', { withTimezone: true }).notNull().defaultNow(),
+    // Lock expiration time (for crash recovery)
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    // Alert ID if the alert was successfully created
+    alertId: uuid('alert_id'),
+    // Whether the alert was successfully sent/stored
+    alertCreated: boolean('alert_created').notNull().default(false),
+  },
+  (table) => [
+    index('idx_dedup_locks_dedup_key').on(table.dedupKey),
+    index('idx_dedup_locks_metric_key').on(table.metricKey),
+    index('idx_dedup_locks_expires_at').on(table.expiresAt),
+    index('idx_dedup_locks_time_bucket').on(table.timeBucket),
+    // Composite index for cleanup queries
+    index('idx_dedup_locks_claimed_created').on(table.claimedAt, table.alertCreated),
+  ]
+);
+
+export type AlertDedupLockRow = typeof alertDedupLocks.$inferSelect;
+export type NewAlertDedupLockRow = typeof alertDedupLocks.$inferInsert;
+
