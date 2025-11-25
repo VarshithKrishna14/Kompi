@@ -1,4 +1,5 @@
 import { AnomalyDetector } from './anomaly-detector';
+import { AlertDeduplicator, InMemoryDeduplicator, PostgresDeduplicator } from './deduplicator';
 
 // Mock types for context
 interface LogEntry {
@@ -17,6 +18,7 @@ const db = {
 
 export class LogProcessor {
   private detector: AnomalyDetector;
+  private deduplicator: AlertDeduplicator;
   private errorCount: number = 0;
   private totalCount: number = 0;
   private lastFlushTime: number = Date.now();
@@ -25,6 +27,16 @@ export class LogProcessor {
   private readonly FLUSH_INTERVAL_MS = 1000; // Check every second
 
   constructor() {
+    // Initialize deduplicator
+    // In production, we would use PostgresDeduplicator with a real connection string
+    const dbUrl = process.env.DATABASE_URL;
+    if (dbUrl) {
+      this.deduplicator = new PostgresDeduplicator(dbUrl);
+    } else {
+      console.log('Using in-memory deduplicator (no DATABASE_URL provided)');
+      this.deduplicator = new InMemoryDeduplicator();
+    }
+
     // In a real app, we would load the serialized model state from DB/Redis here
     // const savedState = await db.query.anomaly_models.findFirst(...)
     // if (savedState) {
@@ -82,10 +94,20 @@ export class LogProcessor {
     const result = this.detector.detect(currentRate);
     
     if (result.isAnomaly) {
-      console.warn(`[ANOMALY DETECTED] ${result.details} (Value: ${result.metricValue.toFixed(2)}, Baseline: ${result.baselineMean.toFixed(2)})`);
-      
-      // Here we would trigger alerts, webhooks, etc.
-      // await sendAlert(result);
+      // Deduplicate alerts
+      // Key: unique identifier for this type of anomaly. 
+      // If we had multiple services, we'd include the serviceId in the key.
+      const alertKey = 'anomaly:global_error_rate';
+      const shouldAlert = await this.deduplicator.shouldAlert(alertKey, 5);
+
+      if (shouldAlert) {
+        console.warn(`[ANOMALY DETECTED] ${result.details} (Value: ${result.metricValue.toFixed(2)}, Baseline: ${result.baselineMean.toFixed(2)})`);
+        
+        // Here we would trigger alerts, webhooks, etc.
+        // await sendAlert(result);
+      } else {
+        console.info(`[SUPPRESSED] Duplicate anomaly detected for ${alertKey}`);
+      }
     }
 
     // Update the model
