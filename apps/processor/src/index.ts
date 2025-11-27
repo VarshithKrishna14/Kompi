@@ -1,5 +1,6 @@
 import { AnomalyDetector } from './anomaly-detector';
 import { AlertDeduplicator, InMemoryDeduplicator, PostgresDeduplicator } from './deduplicator';
+import { ComposioClient } from './packages/ai/src/composio-client';
 
 // Mock types for context
 interface LogEntry {
@@ -22,13 +23,16 @@ export class LogProcessor {
   private errorCount: number = 0;
   private totalCount: number = 0;
   private lastFlushTime: number = Date.now();
-  
+
+  // Tool Router / MCP
+  private composioClient!: ComposioClient;
+  private mcpClient!: any;
+
   // Configuration
   private readonly FLUSH_INTERVAL_MS = 1000; // Check every second
 
   constructor() {
     // Initialize deduplicator
-    // In production, we would use PostgresDeduplicator with a real connection string
     const dbUrl = process.env.DATABASE_URL;
     if (dbUrl) {
       this.deduplicator = new PostgresDeduplicator(dbUrl);
@@ -37,26 +41,30 @@ export class LogProcessor {
       this.deduplicator = new InMemoryDeduplicator();
     }
 
-    // In a real app, we would load the serialized model state from DB/Redis here
-    // const savedState = await db.query.anomaly_models.findFirst(...)
-    // if (savedState) {
-    //   this.detector = AnomalyDetector.hydrate(savedState.json, { ... });
-    // } else {
-      this.detector = new AnomalyDetector({
-        alpha: 0.1, // Adapt relatively quickly
-        minTrainingDataPoints: 10,
-        spikeThresholdMultiplier: 5.0
-      });
-    // }
-    
-    // Start the flush loop if this were a real long-running process
-    // For this implementation, we'll rely on checkFlush() being called on ingest
-    // or an external timer.
+    // Initialize anomaly detector
+    this.detector = new AnomalyDetector({
+      alpha: 0.1,
+      minTrainingDataPoints: 10,
+      spikeThresholdMultiplier: 5.0
+    });
+
+    // Initialize MCP for agentic actions
+    const composioApiKey = process.env.COMPOSIO_API_KEY!;
+    this.composioClient = new ComposioClient({
+      apiKey: composioApiKey,
+      userId: 'tracer-system',
+      toolkits: ['slack', 'jira', 'pagerduty'],
+    });
+
+    this.initMCP().catch(err => console.error('Failed to initialize MCP:', err));
+  }
+
+  private async initMCP() {
+    this.mcpClient = await this.composioClient.createMCPClient();
   }
 
   /**
    * Process a single log entry.
-   * optimized for high throughput (>100k/min).
    */
   public async processLog(log: LogEntry): Promise<void> {
     const now = Date.now();
@@ -68,53 +76,43 @@ export class LogProcessor {
     }
 
     // 2. Periodic flush to anomaly detector
-    // We check on every log if it's time to flush. 
-    // This is low overhead (simple comparison).
     if (now - this.lastFlushTime >= this.FLUSH_INTERVAL_MS) {
       await this.flushMetrics(now);
     }
-    
+
     // 3. Store log (Mock DB)
-    // In production, this would likely be batched as well
-    // await db.insert('logs').values(log); 
+    // await db.insert('logs').values(log);
   }
 
   private async flushMetrics(now: number) {
     const timeDelta = now - this.lastFlushTime;
     if (timeDelta <= 0) return;
 
-    // Calculate error rate (errors per second)
-    // We normalize to "per second" to be consistent regardless of jitter in flush timing
     const currentRate = (this.errorCount / timeDelta) * 1000;
 
-    // Detect Anomaly BEFORE training (so we don't pollute baseline with the anomaly immediately if we want to alert first)
-    // However, for regime adaptation, we DO want to train on it eventually.
-    // Standard practice: Detect -> Alert -> Train
-    
+    // Detect anomaly BEFORE training
     const result = this.detector.detect(currentRate);
-    
+
     if (result.isAnomaly) {
-      // Deduplicate alerts
-      // Key: unique identifier for this type of anomaly. 
-      // If we had multiple services, we'd include the serviceId in the key.
       const alertKey = 'anomaly:global_error_rate';
       const shouldAlert = await this.deduplicator.shouldAlert(alertKey, 5);
 
       if (shouldAlert) {
-        console.warn(`[ANOMALY DETECTED] ${result.details} (Value: ${result.metricValue.toFixed(2)}, Baseline: ${result.baselineMean.toFixed(2)})`);
-        
-        // Here we would trigger alerts, webhooks, etc.
-        // await sendAlert(result);
+        if (!this.mcpClient) {
+          console.warn('[MCP NOT READY] ', result.details);
+        } else {
+          // Trigger alert via Tool Router MCP agent
+          await this.mcpClient.callAgent({
+            agentName: 'log-anomaly-alert-agent',
+            input: `Anomaly detected! Details: ${result.details}, Value: ${result.metricValue.toFixed(2)}, Baseline: ${result.baselineMean.toFixed(2)}`
+          });
+        }
       } else {
         console.info(`[SUPPRESSED] Duplicate anomaly detected for ${alertKey}`);
       }
     }
 
-    // Update the model
-    // We might choose NOT to train on extreme anomalies to avoid polluting the baseline
-    // But requirement says "Adapt to regime changes", so we MUST train even on anomalies 
-    // eventually, or use a separate "long term" baseline.
-    // With EWMA, training on anomalies allows the baseline to shift up to the new "normal" (regime change).
+    // Update the anomaly detector
     this.detector.train(currentRate);
 
     // Reset counters
@@ -126,4 +124,3 @@ export class LogProcessor {
 
 // Singleton instance if needed
 export const logProcessor = new LogProcessor();
-
